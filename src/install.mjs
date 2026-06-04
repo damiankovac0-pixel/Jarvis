@@ -1,8 +1,17 @@
 #!/usr/bin/env node
 
 // ────────────────────────────────────────────────────────────
-// Jarvis Installer — 8-phase setup
+// Jarvis Installer — Modular cross-platform setup
 // Zero external dependencies. Uses Node.js stdlib only.
+//
+// Flow:
+//   1. Welcome + environment detection
+//   2. Profile selection (Lite / Standard / Full / Custom)
+//   3. Customize modules (if Custom chosen or after profile)
+//   4. Provider + API key + GitHub token + autonomy prompts
+//   5. Installation plan summary + confirmation
+//   6. Execute: opencode → npm packages → config → templates → shell → tools
+//   7. Verification + next steps
 // ────────────────────────────────────────────────────────────
 
 import fs from "node:fs"
@@ -12,6 +21,9 @@ import { createInterface } from "node:readline"
 import { spawn, execSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
 
+import { MODULES, PROFILES, resolveModules, getModuleNpmDeps, getModuleTemplateFiles, summarizeSelection } from "./modules.mjs"
+import { buildConfig } from "./config-builder.mjs"
+
 // ── Paths ──────────────────────────────────────────────────
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -19,19 +31,24 @@ const REPO_ROOT = path.resolve(__dirname, "..")
 const CONFIG_DIR = path.join(os.homedir(), ".config", "opencode")
 const NODE_BIN_DIR = path.join(CONFIG_DIR, "node_modules", ".bin")
 const TEMPLATE_DIR = path.join(REPO_ROOT, "template")
+const BACKUP_DIR = path.join(CONFIG_DIR, ".jarvis-backup")
+
+// ── CLI Flags ──────────────────────────────────────────────
+
+const FLAGS = {
+  dryRun: process.argv.includes("--dry-run"),
+  yes: process.argv.includes("--yes") || process.argv.includes("-y"),
+}
 
 // ── ANSI Colors ────────────────────────────────────────────
 
-/** @type {{ [k: string]: string }} */
-const c = { g: "", r: "", y: "", c: "", m: "", b: "", n: "" }
+const c = {}
 if (process.stdout.isTTY) {
-  c.g = "\x1b[32m" // green
-  c.r = "\x1b[31m" // red
-  c.y = "\x1b[33m" // yellow
-  c.c = "\x1b[36m" // cyan
-  c.m = "\x1b[35m" // magenta
-  c.b = "\x1b[1m"  // bold
-  c.n = "\x1b[0m"  // reset
+  c.g = "\x1b[32m"; c.r = "\x1b[31m"; c.y = "\x1b[33m"
+  c.c = "\x1b[36m"; c.m = "\x1b[35m"; c.b = "\x1b[1m"; c.n = "\x1b[0m"
+  c.d = "\x1b[2m"   // dim
+} else {
+  Object.assign(c, { g: "", r: "", y: "", c: "", m: "", b: "", n: "", d: "" })
 }
 
 // ── Logging ────────────────────────────────────────────────
@@ -41,66 +58,56 @@ function info(msg)  { console.log(`  ${c.c}ℹ${c.n} ${msg}`) }
 function warn(msg)  { console.log(`  ${c.y}⚠${c.n} ${msg}`) }
 function fail(msg)  { console.log(`  ${c.r}✗${c.n} ${msg}`) }
 function title(msg) { console.log(`\n${c.b}${msg}${c.n}`) }
-function step(n, msg) { process.stdout.write(`  [${n}/8] ${msg}... `) }
+function line()     { console.log() }
 
-// ── Readline helpers ───────────────────────────────────────
+// ── Input ──────────────────────────────────────────────────
 
 function ask(query) {
   return new Promise((resolve) => {
-    const i = rl()
+    const i = createInterface({ input: process.stdin, output: process.stdout })
     i.question(query, (ans) => { i.close(); resolve(ans.trim()) })
   })
 }
 
-function askMasked(query) {
-  return _maskedInput(query)
-}
-
 async function _maskedInput(prompt) {
   if (process.platform === "win32") {
-    // PowerShell trick: Read-Host -AsSecureString
     const script = `$sec = Read-Host -Prompt ${JSON.stringify(prompt)} -AsSecureString; $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec); [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)`
     try {
       const buf = execSync(`powershell -NoProfile -Command "${script.replace(/"/g, '\\"')}"`, {
-        stdio: ["inherit", "pipe", "pipe"],
-        timeout: 30000,
-        windowsHide: true,
+        stdio: ["inherit", "pipe", "pipe"], timeout: 30000, windowsHide: true,
       })
       return buf.toString("utf-8").trim()
-    } catch {
-      // Fallback to regular input
-      return ask(prompt)
-    }
+    } catch { return ask(prompt) }
   } else {
-    // Unix: stty -echo
     try {
       execSync("stty -echo", { stdio: "pipe" })
       const val = await ask(prompt)
       execSync("stty echo", { stdio: "pipe" })
-      console.log() // newline since echo was off
+      console.log()
       return val
-    } catch {
-      return ask(prompt)
-    }
+    } catch { return ask(prompt) }
   }
 }
 
-function pressEnter() {
-  return ask("  Press Enter to continue, or Ctrl+C to cancel.")
+function askMasked(query) { return _maskedInput(query) }
+
+function pressEnter(msg) {
+  return ask(msg ? `  ${msg} ` : "  Press Enter to continue, or Ctrl+C to cancel. ")
 }
 
 async function confirm(prompt, defaultYes = true) {
+  if (FLAGS.yes) return true
   const hint = defaultYes ? "[Y/n]" : "[y/N]"
   const ans = (await ask(`  ${prompt} ${hint} `)).toLowerCase()
   if (ans === "") return defaultYes
   return ans === "y" || ans === "yes"
 }
 
-async function menuQuestion(prompt, items, defaultIdx = 0) {
-  console.log(`\n  ${prompt}`)
+async function menu(prompt, items, defaultIdx = 0) {
+  console.log(`\n  ${c.b}${prompt}${c.n}`)
   for (let i = 0; i < items.length; i++) {
-    const marker = i === defaultIdx ? " (default)" : ""
-    console.log(`    ${i + 1}) ${items[i]}${marker}`)
+    const marker = i === defaultIdx ? ` ${c.d}(default)${c.n}` : ""
+    console.log(`    ${i + 1}. ${items[i]}${marker}`)
   }
   const ans = await ask(`  Enter [1-${items.length}]: `)
   const num = parseInt(ans, 10)
@@ -108,15 +115,63 @@ async function menuQuestion(prompt, items, defaultIdx = 0) {
   return defaultIdx
 }
 
+async function checklist(title, items, defaults) {
+  // items: Array<{id: string, label: string}>
+  // defaults: Set<string> of pre-selected IDs
+  // Returns: Set<string> of selected IDs
+  const selected = new Set(defaults || [])
+
+  console.log(`\n  ${c.b}${title}${c.n}`)
+  console.log(`  ${c.d}Use numbers to toggle. Press Enter when done.${c.n}\n`)
+
+  // Display items in pages
+  const pageSize = 10
+  let offset = 0
+  let done = false
+
+  while (!done) {
+    const page = items.slice(offset, offset + pageSize)
+    const showNav = items.length > pageSize
+
+    for (let i = 0; i < page.length; i++) {
+      const idx = offset + i
+      const item = items[idx]
+      const check = selected.has(item.id) ? "●" : "○"
+      console.log(`    ${idx + 1}. ${check} ${item.label}`)
+    }
+
+    if (showNav) {
+      console.log(``)
+      if (offset > 0) console.log(`    p. Previous page`)
+      if (offset + pageSize < items.length) console.log(`    n. Next page`)
+    }
+
+    const ans = await ask(`  Enter number to toggle, or Enter to finish: `)
+    if (ans === "") {
+      done = true
+    } else if (ans === "n" && showNav && offset + pageSize < items.length) {
+      offset += pageSize
+    } else if (ans === "p" && showNav && offset > 0) {
+      offset -= pageSize
+    } else {
+      const num = parseInt(ans, 10)
+      if (num >= 1 && num <= items.length) {
+        const item = items[num - 1]
+        if (selected.has(item.id)) selected.delete(item.id)
+        else selected.add(item.id)
+      }
+    }
+  }
+
+  return selected
+}
+
 // ── Spinner ────────────────────────────────────────────────
 
 let _spinnerInterval = null
 
 function startSpinner(text) {
-  if (!process.stdout.isTTY) {
-    console.log(`  ${text}...`)
-    return
-  }
+  if (!process.stdout.isTTY) { console.log(`  ${text}...`); return }
   const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
   let i = 0
   process.stdout.write(`  ${c.c}${frames[0]}${c.n} ${text}... `)
@@ -128,14 +183,9 @@ function startSpinner(text) {
 
 function stopSpinner(success = true) {
   if (_spinnerInterval) {
-    clearInterval(_spinnerInterval)
-    _spinnerInterval = null
+    clearInterval(_spinnerInterval); _spinnerInterval = null
     process.stdout.write("\r")
-    if (success) {
-      console.log(`  ${c.g}✓${c.n}`)
-    } else {
-      console.log(`  ${c.r}✗${c.n}`)
-    }
+    console.log(success ? `  ${c.g}✓${c.n}` : `  ${c.r}✗${c.n}`)
   }
 }
 
@@ -144,12 +194,9 @@ function stopSpinner(success = true) {
 function exec(cmd, args = [], opts = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, {
-      stdio: "pipe",
-      windowsHide: true,
-      ...opts,
+      stdio: "pipe", windowsHide: true, ...opts,
     })
-    let stdout = ""
-    let stderr = ""
+    let stdout = "", stderr = ""
     child.stdout.on("data", (d) => { stdout += d.toString() })
     child.stderr.on("data", (d) => { stderr += d.toString() })
     child.on("close", (code) => {
@@ -178,967 +225,684 @@ function copyFile(src, dst) {
   fs.copyFileSync(src, dst)
 }
 
+function backupDir(src) {
+  if (!fileExists(src)) return false
+  const ts = Date.now()
+  const dest = `${BACKUP_DIR}-${ts}`
+  fs.mkdirSync(dest, { recursive: true })
+  // Copy recursively
+  for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
+    const s = path.join(src, entry.name)
+    const d = path.join(dest, entry.name)
+    if (entry.isDirectory()) {
+      fs.cpSync(s, d, { recursive: true })
+    } else {
+      fs.copyFileSync(s, d)
+    }
+  }
+  return dest
+}
+
 function readDirRecursive(dir) {
   const entries = []
   try {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const full = path.join(dir, entry.name)
-      if (entry.isDirectory()) {
-        entries.push(...readDirRecursive(full))
-      } else {
-        entries.push(full)
-      }
+      if (entry.isDirectory()) entries.push(...readDirRecursive(full))
+      else entries.push(full)
     }
   } catch { /* skip */ }
   return entries
 }
 
-// ── Detect helpers ─────────────────────────────────────────
+// ── Detection ──────────────────────────────────────────────
 
 function detectShell() {
   if (process.platform === "win32") return "powershell"
   const fromEnv = process.env.SHELL || ""
-  if (fromEnv.includes("zsh"))    return "zsh"
-  if (fromEnv.includes("fish"))   return "fish"
+  if (fromEnv.includes("zsh"))  return "zsh"
+  if (fromEnv.includes("fish")) return "fish"
   return "bash"
 }
 
-function detectWsl() {
-  try {
-    const v = fs.readFileSync("/proc/version", "utf-8")
-    return v.includes("Microsoft") || v.includes("WSL")
-  } catch { return false }
-}
-
-// Check if a tool is available in PATH
 function hasTool(name) {
   try {
-    if (process.platform === "win32") {
-      execSync(`where ${name}`, { stdio: "pipe" })
-    } else {
-      execSync(`command -v ${name}`, { stdio: "pipe" })
-    }
+    if (process.platform === "win32") execSync(`where ${name}`, { stdio: "pipe" })
+    else execSync(`command -v ${name}`, { stdio: "pipe" })
     return true
   } catch { return false }
 }
 
-// Check Python version
-function checkPython() {
-  for (const cmd of ["python3", "python"]) {
-    try {
-      const v = execSync(`${cmd} --version`, { stdio: "pipe" }).toString()
-      if (v.match(/Python (\d+)\.(\d+)/)) {
-        const major = parseInt(RegExp.$1, 10)
-        const minor = parseInt(RegExp.$2, 10)
-        if (major > 3 || (major === 3 && minor >= 10)) {
-          return cmd
-        }
-      }
-    } catch { /* try next */ }
-  }
-  return null
+function detectLanguages() {
+  const langs = {}
+  langs.typescript = hasTool("tsc") || hasTool("node")
+  langs.python = hasTool("python") || hasTool("python3")
+  langs.html = true   // always include
+  langs.css = true
+  langs.json = true
+  langs.yaml = hasTool("yq") || hasTool("yamllint")
+  langs.bash = process.platform !== "win32" || hasTool("bash")
+  langs.docker = hasTool("docker")
+  langs.eslint = hasTool("eslint")
+  langs.php = hasTool("php")
+  langs.sql = hasTool("sqlite3") || hasTool("sqlcmd")
+  langs.ansible = hasTool("ansible")
+  langs.prisma = hasTool("prisma")
+  return langs
 }
 
-// ────────────────────────────────────────────────────────────
-// Context type (exported for config-builder)
-// ────────────────────────────────────────────────────────────
+function detectExistingConfig() {
+  const configPath = path.join(CONFIG_DIR, "opencode.jsonc")
+  if (!fileExists(configPath)) return null
+  try {
+    const raw = fs.readFileSync(configPath, "utf-8")
+    return { path: configPath, raw }
+  } catch { return null }
+}
 
-/**
- * @typedef {Object} InstallContext
- * @property {string} platform
- * @property {string} arch
- * @property {string} shell
- * @property {string} homeDir
- * @property {string} configDir
- * @property {string} nodeBinDir
- * @property {object} models
- * @property {string} models.primary
- * @property {string} models.fast
- * @property {object} langs
- * @property {object} tools
- * @property {object} provider
- * @property {string} provider.type
- * @property {string} provider.baseURL
- * @property {string|null} provider.apiKeyRef
- * @property {object} mcp
- * @property {{enabled: boolean, tokenRef: string|null}} mcp.github
- * @property {object} headroom
- * @property {boolean} headroom.enabled
- * @property {string|null} pythonPath
- * @property {string} autonomy
- */
-
-// ────────────────────────────────────────────────────────────
-// Phase 1: Environment Detection
-// ────────────────────────────────────────────────────────────
-
-async function detectEnvironment() {
-  /** @type {InstallContext} */
-  const ctx = {
-    platform: process.platform,
-    arch: process.arch,
-    shell: detectShell(),
-    homeDir: os.homedir(),
-    configDir: CONFIG_DIR,
-    nodeBinDir: NODE_BIN_DIR,
-    models: { primary: "", fast: "" },
-    langs: {
-      typescript: false,
-      python: false,
-      html: true,    // always available
-      css: true,     // always available
-      json: true,    // always available
-      yaml: true,    // always available
-      bash: detectShell() !== "powershell", // available on Unix
-      docker: false,
-      eslint: false,
-      php: false,
-      sql: false,
-      ansible: false,
-      prisma: false,
-    },
-    tools: {
-      rg: hasTool("rg"),
-      fd: hasTool("fd"),
-      jq: hasTool("jq"),
-      uv: hasTool("uv"),
-      git: hasTool("git"),
-    },
-    provider: {
-      type: "openai",
-      baseURL: "https://api.openai.com/v1",
-      apiKeyRef: null,
-    },
-    mcp: {
-      github: {
-        enabled: false,
-        tokenRef: null,
-      },
-    },
-    headroom: {
-      enabled: false,
-      pythonPath: null,
-    },
-    autonomy: "full",
-  }
-
-  // Detect languages
-  ctx.langs.typescript = hasTool("node")
-  ctx.langs.python = hasTool("python3") || hasTool("python")
-  ctx.langs.docker = hasTool("docker")
-  ctx.langs.eslint = ctx.langs.typescript // eslint requires node
-  ctx.langs.php = hasTool("php")
-  ctx.langs.sql = hasTool("sqlite3") || hasTool("sqlite")
-  ctx.langs.ansible = hasTool("ansible") || hasTool("ansible-playbook")
-  ctx.langs.prisma = hasTool("prisma")
-
-  // On Windows, bash LSP is still useful (Git Bash, WSL)
+function findNpm() {
   if (process.platform === "win32") {
-    ctx.langs.bash = hasTool("bash") || detectWsl()
-  }
-
-  // Detect Python for headroom
-  ctx.pythonPath = checkPython()
-  ctx.headroom.enabled = ctx.pythonPath !== null
-  ctx.headroom.pythonPath = ctx.pythonPath
-
-  // Check for existing install
-  ctx.hasExisting = fileExists(path.join(CONFIG_DIR, "opencode.jsonc"))
-  if (ctx.hasExisting) {
     try {
-      const existing = JSON.parse(readFile(path.join(CONFIG_DIR, "opencode.jsonc")))
-      ctx.existingConfig = existing
-      // Extract existing provider info for reuse
-      if (existing.provider?.openai?.apiKey) {
-        ctx.existingApiKeyRef = existing.provider.openai.apiKey
-      }
-      if (existing.provider?.anthropic?.apiKey) {
-        ctx.existingApiKeyRef = existing.provider.anthropic.apiKey
-      }
-      // Extract existing GitHub token
-      if (existing.mcp?.github?.environment?.GITHUB_TOKEN) {
-        ctx.existingGithubRef = existing.mcp.github.environment.GITHUB_TOKEN
-      }
-    } catch { /* ignore parse errors */ }
+      const where = execSync("where npm", { stdio: "pipe" }).toString().trim().split("\n")[0]
+      return where
+    } catch { return "npm" }
   }
-
-  // Check if opencode is installed globally
-  ctx.hasOpencode = hasTool("opencode")
-
-  return ctx
+  return "npm"
 }
 
-// ────────────────────────────────────────────────────────────
-// Phase 2: User Prompts
-// ────────────────────────────────────────────────────────────
+// ── Phase Runner ──────────────────────────────────────────
 
-async function promptProvider(ctx) {
-  if (ctx.hasExisting) {
-    const reuse = await confirm(
-      `Existing config found. Reuse provider settings?`,
-      true
-    )
-    if (reuse) {
-      // Keep existing config — skip all prompts
-      ctx.skipPrompts = true
-      return
-    }
-  }
-
-  const providerNames = [
-    "OpenAI — GPT-4o, GPT-4o-mini (requires API key)",
-    "Anthropic — Claude Sonnet 4, Haiku 3.5 (requires API key)",
-    "Ollama — Free, runs locally (no API key)",
-    "Custom — Any OpenAI-compatible endpoint",
-  ]
-  const idx = await menuQuestion("Which AI provider?", providerNames, 0)
-
-  const providerTypes = ["openai", "anthropic", "ollama", "custom"]
-  ctx.provider.type = providerTypes[idx]
-
-  // Set model defaults per provider
-  const modelDefaults = {
-    openai:  { primary: "gpt-4o",             fast: "gpt-4o-mini" },
-    anthropic: { primary: "claude-sonnet-4-20250514", fast: "claude-haiku-3-5" },
-    ollama:  { primary: "llama3.1:70b",         fast: "llama3.1:8b" },
-    custom:  { primary: "",                     fast: "" },
-  }
-  const defaults = modelDefaults[ctx.provider.type]
-
-  // Custom provider: ask for base URL first
-  if (ctx.provider.type === "custom") {
-    const url = await ask(`  Enter your API endpoint URL:\n  (e.g. http://localhost:8787/v1) `)
-    ctx.provider.baseURL = url || "http://localhost:8787/v1"
-  } else if (ctx.provider.type === "ollama") {
-    ctx.provider.baseURL = "http://localhost:11434/v1"
-  } else if (ctx.provider.type === "openai") {
-    ctx.provider.baseURL = "https://api.openai.com/v1"
-  } else if (ctx.provider.type === "anthropic") {
-    ctx.provider.baseURL = "https://api.anthropic.com"
-  }
-
-  // Model selection
-  const primaryHint = defaults.primary ? ` (default: ${defaults.primary})` : ""
-  const fastHint = defaults.fast ? ` (default: ${defaults.fast})` : ""
-
-  const primaryModel = await ask(`  Model for complex reasoning (primary):${primaryHint} `)
-  ctx.models.primary = primaryModel || defaults.primary
-
-  const fastModel = await ask(`  Model for fast tasks (subagents):${fastHint} `)
-  ctx.models.fast = fastModel || defaults.fast
-}
-
-async function promptApiKey(ctx) {
-  if (ctx.skipPrompts) return
-  if (ctx.provider.type === "ollama") {
-    info("Ollama runs locally — no API key needed.")
-    return
-  }
-
-  const envVarName = {
-    openai: "OPENAI_API_KEY",
-    anthropic: "ANTHROPIC_API_KEY",
-    custom: "CUSTOM_API_KEY",
-  }[ctx.provider.type]
-
-  // Check if already set in environment
-  const envKey = process.env[envVarName]
-  if (envKey) {
-    ctx.provider.apiKeyRef = `\${${envVarName}}`
-    ok(`${envVarName} found in environment.`)
-    return
-  }
-
-  // Check if we have a key reference from existing config
-  if (ctx.existingApiKeyRef) {
-    const reuse = await confirm(
-      `Reuse existing API key reference (${ctx.existingApiKeyRef})?`,
-      true
-    )
-    if (reuse) {
-      ctx.provider.apiKeyRef = ctx.existingApiKeyRef
-      return
-    }
-  }
-
-  console.log(`\n  Enter your ${ctx.provider.type} API key:`)
-  console.log(`  (Leave blank to use ${envVarName} environment variable)`)
-  const key = await _maskedInput("  API key: ")
-
-  if (!key) {
-    ctx.provider.apiKeyRef = `\${${envVarName}}`
-    warn(`No key entered. Set ${envVarName}=your_key in your environment.`)
-    return
-  }
-
-  // Validate format
-  if (ctx.provider.type === "openai" && !key.startsWith("sk-")) {
-    warn("Key doesn't start with 'sk-'. OpenAI keys usually do.")
-  }
-  if (ctx.provider.type === "anthropic" && !key.startsWith("sk-ant-")) {
-    warn("Key doesn't start with 'sk-ant-'. Anthropic keys usually do.")
-  }
-
-  const store = await confirm(
-    "Store key as system environment variable? (Recommended)",
-    true
-  )
-
-  if (store) {
-    try {
-      if (process.platform === "win32") {
-        execSync(
-          `setx ${envVarName} "${key}" /M`,
-          { stdio: "pipe", timeout: 10000 }
-        )
-      } else {
-        const profileFile = path.join(os.homedir(), ".profile")
-        const line = `\nexport ${envVarName}="${key}"\n`
-        fs.appendFileSync(profileFile, line, "utf-8")
-      }
-      ctx.provider.apiKeyRef = `\${${envVarName}}`
-      ok(`Stored as ${envVarName}.`)
-    } catch (e) {
-      warn(`Could not store env var: ${e.message}`)
-      ctx.provider.apiKeyRef = `\${${envVarName}}`
-    }
-  } else {
-    // User chose not to store in env — store key reference anyway
-    ctx.provider.apiKeyRef = `\${${envVarName}}`
-    warn(`Set ${envVarName}=your_key in your environment before using Jarvis.`)
+async function runPhase(num, total, name, fn) {
+  process.stdout.write(`  [${num}/${total}] ${name}... `)
+  try {
+    await fn()
+    console.log(`${c.g}✓${c.n}`)
+    return true
+  } catch (err) {
+    console.log(`${c.r}✗${c.n}`)
+    fail(err.message || String(err))
+    return false
   }
 }
 
-async function promptLangs(ctx) {
-  if (ctx.skipPrompts) return
+// ════════════════════════════════════════════════════════════
+// MAIN
+// ════════════════════════════════════════════════════════════
 
-  const langLabels = {
-    typescript: "TypeScript/JavaScript",
-    python: "Python",
-    html: "HTML",
-    css: "CSS/Sass/Less",
-    json: "JSON/JSONC",
-    yaml: "YAML",
-    bash: "Shell script",
-    docker: "Dockerfile",
-    eslint: "ESLint",
-    php: "PHP",
-    sql: "SQL",
-    ansible: "Ansible",
-    prisma: "Prisma",
+async function main() {
+  // ── Welcome ────────────────────────────────────────────
+  console.log(`
+${c.m}╔══════════════════════════════════════════╗${c.n}
+${c.m}║${c.n}  ${c.b}JARVIS Terminal Setup${c.n}              ${c.m}║${c.n}
+${c.m}║${c.n}  One AI to rule your terminal          ${c.m}║${c.n}
+${c.m}╚══════════════════════════════════════════╝${c.n}
+${c.d}  Version 1.0.0 • Cross-platform${c.n}
+`)
+
+  if (FLAGS.dryRun) {
+    warn(`Running in ${c.b}--dry-run${c.n} mode. No changes will be made.\n`)
   }
 
-  console.log(`\n  Language server support — detected on your system:`)
-  const langKeys = Object.keys(ctx.langs)
-  for (const key of langKeys) {
-    const detected = ctx.langs[key] ? `${c.g}detected${c.n}` : `${c.y}optional${c.n}`
-    const toggled = ctx.langs[key] ? `${c.g}*${c.n}` : ` `
-    console.log(`  [${toggled}] ${langLabels[key]} (${detected})`)
+  // ── Detect environment ────────────────────────────────
+  title("Detecting Environment")
+  const env = {
+    platform: process.platform,
+    shell: detectShell(),
+    nodeVersion: process.versions.node,
+    configDir: CONFIG_DIR,
+    homeDir: os.homedir(),
+    detectedLangs: detectLanguages(),
+    hasGit: hasTool("git"),
+    hasPython: hasTool("python3") || hasTool("python"),
+    existingConfig: detectExistingConfig(),
   }
 
-  const edit = await confirm(
-    `\n  Toggle selections? (currently ${
-      Object.values(ctx.langs).filter(Boolean).length
-    } active)`,
-    false
-  )
+  info(`Platform: ${env.platform}`)
+  info(`Shell: ${env.shell}`)
+  info(`Node.js: v${env.nodeVersion}`)
+  info(`Config: ${CONFIG_DIR}`)
+  if (env.existingConfig) info("Existing config detected — will offer backup")
 
-  if (edit) {
-    for (const key of langKeys) {
-      const current = ctx.langs[key]
-      const label = langLabels[key]
-      const ans = await confirm(`  ${label}?`, current)
-      ctx.langs[key] = ans
-    }
-  }
-}
+  // ── Profile selection ─────────────────────────────────
+  title("Choose Your Setup")
 
-async function promptGithub(ctx) {
-  if (ctx.skipPrompts) return
+  const profileKeys = Object.keys(PROFILES)
+  const profileNames = profileKeys.map((k) => {
+    const p = PROFILES[k]
+    return `${c.b}${p.name}${c.n} — ${p.tagline}\n             ${c.d}${p.description}${c.n}`
+  })
 
-  const envToken = process.env.GITHUB_TOKEN
-  if (envToken) {
-    ctx.mcp.github.enabled = true
-    ctx.mcp.github.tokenRef = "${GITHUB_TOKEN}"
-    ok("GITHUB_TOKEN found in environment.")
-    return
-  }
-
-  if (ctx.existingGithubRef) {
-    const reuse = await confirm(
-      `Reuse existing GitHub token reference?`,
-      true
-    )
-    if (reuse) {
-      ctx.mcp.github.enabled = true
-      ctx.mcp.github.tokenRef = ctx.existingGithubRef
-      return
-    }
-  }
-
-  const add = await confirm(
-    "Enable GitHub integration? (repo search, PRs, issues)",
-    false
-  )
-  if (!add) {
-    ctx.mcp.github.enabled = false
-    return
-  }
-
-  console.log(`\n  Enter GitHub token (or press Enter to skip):`)
-  console.log(`  (Create at: https://github.com/settings/tokens)`)
-  const token = await _maskedInput("  Token: ")
-
-  if (!token) {
-    ctx.mcp.github.enabled = false
-    warn("GitHub MCP disabled — no token provided.")
-    return
-  }
-
-  const store = await confirm(
-    "Store token as GITHUB_TOKEN environment variable?",
-    true
-  )
-
-  if (store) {
-    try {
-      if (process.platform === "win32") {
-        execSync(`setx GITHUB_TOKEN "${token}"`, { stdio: "pipe", timeout: 10000 })
-      } else {
-        const profileFile = path.join(os.homedir(), ".profile")
-        const line = `\nexport GITHUB_TOKEN="${token}"\n`
-        fs.appendFileSync(profileFile, line, "utf-8")
-      }
-      ctx.mcp.github.tokenRef = "${GITHUB_TOKEN}"
-    } catch (e) {
-      warn(`Could not store: ${e.message}`)
-      ctx.mcp.github.tokenRef = "${GITHUB_TOKEN}"
-    }
-  } else {
-    ctx.mcp.github.tokenRef = "${GITHUB_TOKEN}"
-  }
-  ctx.mcp.github.enabled = true
-  ok("GitHub integration configured.")
-}
-
-async function promptAutonomy(ctx) {
-  if (ctx.skipPrompts) return
-
-  const choice = await menuQuestion(
-    `${c.b}Autonomy level:${c.n}`,
+  const profileIdx = await menu(
+    "Which profile fits you best?",
     [
-      `${c.g}FULL${c.n} — Jarvis edits files, runs commands, browses the web without asking. (Your call.)`,
-      `${c.y}SAFE${c.n} — Jarvis asks before destructive actions. (Recommended for first-time users.)`,
+      `${profileNames[0]}`,
+      `${profileNames[1]}`,
+      `${profileNames[2]}`,
+      `${c.b}Custom${c.n} — Pick individual modules yourself`,
+    ],
+    profileKeys.indexOf("standard") // default to Standard
+  )
+
+  let selectedModules
+
+  if (profileIdx === 3) {
+    // Custom — show module checklist
+    const allModuleItems = Object.values(MODULES)
+      .filter((m) => m.id !== "core") // core is auto-included
+      .map((m) => ({
+        id: m.id,
+        label: `${c.b}${m.name}${c.n}\n             ${c.d}${m.description}${c.n}`,
+      }))
+
+    const customSelected = await checklist(
+      "Select modules to install (core is always included):",
+      allModuleItems,
+      new Set(PROFILES.standard.modules.filter((m) => m !== "core"))
+    )
+
+    selectedModules = resolveModules(["core", ...customSelected])
+  } else {
+    selectedModules = resolveModules(profileKeys[profileIdx])
+  }
+
+  // ── Show summary ──────────────────────────────────────
+  const summary = summarizeSelection(selectedModules)
+  line()
+  console.log(`  ${c.b}Selected modules (${summary.moduleCount}):${c.n}`)
+  for (const m of summary.modules) {
+    console.log(`    ${c.c}◆${c.n} ${m.name}${c.d} — ${m.desc}${c.n}`)
+  }
+  console.log(`  ${c.d}└─ npm packages: ${summary.npmCount}  •  template files: ${summary.fileCount}  •  config sections: ${summary.sectionCount}${c.n}`)
+
+  // ── Provider selection ────────────────────────────────
+  title("AI Provider Setup")
+  info("Jarvis needs an AI provider to function. Your API key is stored as an environment variable — never in config files.")
+
+  const providerTypes = [
+    `${c.b}OpenAI${c.n} — GPT-4o, GPT-4o-mini, o3, etc.`,
+    `${c.b}Anthropic${c.n} — Claude Sonnet 4, Claude Haiku 3.5, etc.`,
+    `${c.b}Ollama${c.n} — Local, free, runs on your machine`,
+    `${c.b}Custom${c.n} — Any OpenAI-compatible endpoint`,
+  ]
+
+  const providerIdx = await menu("Which AI provider?", providerTypes, 0)
+
+  const providerTypes_map = ["openai", "anthropic", "ollama", "custom"]
+  const providerType = providerTypes_map[providerIdx]
+
+  // Model selection per provider
+  const defaultModels = {
+    openai: { primary: "gpt-4o", fast: "gpt-4o-mini" },
+    anthropic: { primary: "claude-sonnet-4-20250514", fast: "claude-haiku-3-5-20241022" },
+    ollama: { primary: "llama3", fast: "llama3" },
+    custom: { primary: "gpt-4o", fast: "gpt-4o-mini" },
+  }
+
+  const models = { ...defaultModels[providerType] }
+
+  if (providerType !== "ollama") {
+    const modelAns = await ask(`  Primary (powerful) model [${models.primary}]: `)
+    if (modelAns.trim()) models.primary = modelAns.trim()
+    const fastAns = await ask(`  Fast (cheap) model for subagents [${models.fast}]: `)
+    if (fastAns.trim()) models.fast = fastAns.trim()
+  }
+
+  // API key
+  let apiKey = ""
+  const envVarName = providerType === "openai" ? "OPENAI_API_KEY"
+    : providerType === "anthropic" ? "ANTHROPIC_API_KEY"
+    : providerType === "custom" ? "CUSTOM_API_KEY"
+    : ""
+
+  if (providerType === "ollama") {
+    info("Ollama runs fully local — no API key needed.")
+  } else {
+    if (process.env[envVarName]) {
+      const useExisting = await confirm(`Use existing ${envVarName} environment variable?`, true)
+      if (useExisting) {
+        apiKey = `\${${envVarName}}`
+      }
+    }
+
+    if (!apiKey) {
+      apiKey = await askMasked(`  Enter your ${providerType} API key: `)
+      apiKey = `\${${envVarName}}`
+      info(`Key stored as ${envVarName} environment variable reference.`)
+    }
+  }
+
+  // Optional: custom endpoint
+  let customEndpoint = ""
+  if (providerType === "custom") {
+    customEndpoint = await ask("  Custom API endpoint URL (e.g., https://api.example.com/v1): ")
+  }
+
+  // ── GitHub token ──────────────────────────────────────
+  let hasGithubToken = false
+  if (selectedModules.includes("mcp-github") || selectedModules.includes("mcp-github")) {
+    // Note: mcp-github could be selected
+    title("GitHub Integration")
+    if (process.env.GITHUB_TOKEN) {
+      hasGithubToken = await confirm("GitHub token found in environment. Enable GitHub MCP?", true)
+    } else {
+      const addGithub = await confirm("Enable GitHub integration? (requires a GitHub personal access token)", false)
+      if (addGithub) {
+        // MCP is already selected — just note the token
+        info("You'll need a GitHub token. Set it later as: export GITHUB_TOKEN=ghp_...")
+        hasGithubToken = true
+      } else {
+        // Remove GitHub MCP from selection
+        selectedModules = resolveModules(selectedModules.filter((m) => m !== "mcp-github"))
+        info("GitHub MCP removed from selection.")
+      }
+    }
+  }
+
+  // ── Autonomy ──────────────────────────────────────────
+  title("Autonomy Level")
+  const autonomyIdx = await menu(
+    "How much freedom should Jarvis have?",
+    [
+      `${c.b}Full autonomy${c.n} — Jarvis can read, edit, execute any command without asking. ${c.d}(Recommended for power users)${c.n}`,
+      `${c.b}Safe mode${c.n} — Jarvis asks before editing files or running commands. ${c.d}(Safer, more verbose)${c.n}`,
     ],
     0
   )
+  const autonomy = autonomyIdx === 0 ? "full" : "safe"
 
-  if (choice === 0) {
-    console.log(`\n  ${c.r}${c.b}⚠  Full autonomy means Jarvis can modify your system without confirmation.${c.n}`)
-    const confirm_text = await ask(`  ${c.b}Type "YES" to confirm:${c.n} `)
-    if (confirm_text === "YES") {
-      ctx.autonomy = "full"
-    } else {
-      info("Falling back to SAFE mode.")
-      ctx.autonomy = "safe"
-    }
-  } else {
-    ctx.autonomy = "safe"
-  }
-}
+  // ── Dry-run check ─────────────────────────────────────
+  if (FLAGS.dryRun) {
+    line()
+    info(`${c.b}Dry run complete — no changes made.${c.n}`)
+    line()
 
-// ────────────────────────────────────────────────────────────
-// Phase 3: Dependency Installation
-// ────────────────────────────────────────────────────────────
-
-async function installDependencies(ctx) {
-  step(1, "Installing npm packages (18 dependencies)")
-
-  // Ensure config directory exists
-  fs.mkdirSync(CONFIG_DIR, { recursive: true })
-
-  // Copy package.json to config dir
-  const srcPkg = path.join(REPO_ROOT, "package.json")
-  const dstPkg = path.join(CONFIG_DIR, "package.json")
-  if (fileExists(srcPkg)) {
-    copyFile(srcPkg, dstPkg)
-  }
-
-  // Run npm install
-  try {
-    const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm"
-    const pkgLock = path.join(CONFIG_DIR, "package-lock.json")
-    const installCmd = fileExists(pkgLock) ? "ci" : "install"
-
-    startSpinner("npm dependencies")
-    await exec(npmCmd, [installCmd, "--no-audit", "--no-fund"], {
-      cwd: CONFIG_DIR,
-      timeout: 300000, // 5 min timeout
-    })
-    stopSpinner(true)
-    ok("Packages installed.")
-  } catch (e) {
-    stopSpinner(false)
-    const msg = e.message || "unknown error"
-    fail(`npm install failed: ${msg}`)
-    warn("You can retry manually: cd ~/.config/opencode && npm install")
-    warn("Check your network connection and proxy settings.")
-    const retry = await confirm("Retry npm install?", true)
-    if (retry) return installDependencies(ctx)
-    throw new Error("npm install failed")
-  }
-
-  // Install opencode globally
-  if (!ctx.hasOpencode) {
-    step(1, "Installing opencode globally")
+    // Show what would be installed
+    const npmDeps = getModuleNpmDeps(selectedModules, {})
+    // Read package.json for versions
+    let pkgVersions = {}
     try {
-      startSpinner("npm install -g @opencode-ai/opencode")
-      const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm"
-      await exec(npmCmd, ["install", "-g", "@opencode-ai/opencode", "--no-audit", "--no-fund"], {
-        timeout: 120000,
-      })
-      stopSpinner(true)
-      ok("opencode installed globally.")
-    } catch (e) {
-      stopSpinner(false)
-      warn(`Could not install opencode globally: ${e.message}`)
-      warn("You can install manually: npm install -g @opencode-ai/opencode")
-    }
-  } else {
-    info("opencode already installed globally.")
-  }
-
-  // Install headroom if Python available
-  if (ctx.headroom.enabled && ctx.pythonPath) {
-    step(1, "Installing headroom (output compression)")
-    try {
-      startSpinner("pip install headroom")
-      if (ctx.tools.uv) {
-        await exec("uv", ["pip", "install", "headroom"], { timeout: 60000 })
-      } else {
-        await exec(ctx.pythonPath, ["-m", "pip", "install", "headroom"], { timeout: 60000 })
-      }
-      stopSpinner(true)
-      ok("headroom installed.")
-    } catch (e) {
-      stopSpinner(false)
-      warn(`headroom install failed: ${e.message}`)
-      ctx.headroom.enabled = false
-    }
-  } else if (!ctx.headroom.enabled) {
-    info("Python not found — headroom compression skipped (optional).")
-  }
-}
-
-// ────────────────────────────────────────────────────────────
-// Phase 4: Config Generation
-// ────────────────────────────────────────────────────────────
-
-async function generateConfig(ctx) {
-  step(2, "Generating configuration")
-
-  // Import config-builder dynamically (ESM, URL-based for cross-platform)
-  const configBuilderUrl = new URL("config-builder.mjs", import.meta.url).href
-  const { buildConfig } = await import(configBuilderUrl)
-  const config = buildConfig(ctx)
-
-  // Write as formatted JSON
-  const configPath = path.join(CONFIG_DIR, "opencode.jsonc")
-  writeFile(configPath, JSON.stringify(config, null, 2) + "\n")
-
-  ok("Configuration written.")
-}
-
-// ────────────────────────────────────────────────────────────
-// Phase 5: File Operations
-// ────────────────────────────────────────────────────────────
-
-async function copyFiles() {
-  step(3, "Copying agent files, plugins, and skills")
-
-  // Walk template directory and copy all files to config dir
-  const templateFiles = readDirRecursive(TEMPLATE_DIR)
-
-  let copied = 0
-  let skipped = 0
-  for (const src of templateFiles) {
-    const rel = path.relative(TEMPLATE_DIR, src)
-    const dst = path.join(CONFIG_DIR, rel)
-
-    // Check if file already exists with same content
-    if (fileExists(dst)) {
-      const existingContent = readFile(dst)
-      const newContent = readFile(src)
-      if (existingContent === newContent) {
-        skipped++
-        continue
-      }
-      // Content differs — back up the existing file
-      const backupPath = dst + ".bak." + new Date().toISOString().replace(/[:.]/g, "-")
-      fs.copyFileSync(dst, backupPath)
-    }
-
-    fs.mkdirSync(path.dirname(dst), { recursive: true })
-    fs.copyFileSync(src, dst)
-    copied++
-  }
-
-  if (copied > 0) ok(`${copied} files copied (${skipped} unchanged).`)
-  else ok(`${skipped} files up-to-date.`)
-}
-
-// ────────────────────────────────────────────────────────────
-// Phase 6: Shell Integration
-// ────────────────────────────────────────────────────────────
-
-async function setupShellIntegration(ctx) {
-  step(4, "Adding 'jarvis' command to shell")
-
-  const aliasLine = "alias jarvis='opencode --agent jarvis'"
-  const funcLine = "function jarvis { opencode --agent jarvis @args }"
-  const header = "# Jarvis Terminal — one AI to rule your terminal"
-
-  let added = false
-
-  if (ctx.shell === "powershell" && process.platform === "win32") {
-    // Check all PowerShell profiles
-    const profilePaths = [
-      path.join(os.homedir(), "Documents", "WindowsPowerShell", "Microsoft.PowerShell_profile.ps1"),
-      path.join(os.homedir(), "Documents", "PowerShell", "Microsoft.PowerShell_profile.ps1"),
-    ]
-
-    for (const profilePath of profilePaths) {
-      const profileDir = path.dirname(profilePath)
-      fs.mkdirSync(profileDir, { recursive: true })
-
-      let content = readFile(profilePath) || ""
-      if (content.includes("function jarvis")) {
-        info(`jarvis function already in ${path.basename(profilePath)}`)
-        continue
-      }
-
-      // Backup
-      if (fileExists(profilePath)) {
-        copyFile(profilePath, profilePath + ".jarvis-backup")
-      }
-
-      content += `\n${header}\n${funcLine}\n`
-      writeFile(profilePath, content)
-      added = true
-    }
-  } else {
-    // Unix: bash / zsh / fish
-    const profiles = []
-    if (ctx.shell === "zsh") {
-      profiles.push(path.join(os.homedir(), ".zshrc"))
-    } else if (ctx.shell === "fish") {
-      const fishDir = path.join(os.homedir(), ".config", "fish")
-      const funcDir = path.join(fishDir, "functions")
-      fs.mkdirSync(funcDir, { recursive: true })
-      const fishFunc = path.join(funcDir, "jarvis.fish")
-      if (!fileExists(fishFunc)) {
-        writeFile(fishFunc, `function jarvis --description "Launch Jarvis AI terminal assistant"\n    opencode --agent jarvis $argv\nend\n`)
-        added = true
-      } else {
-        info("jarvis.fish already exists.")
-      }
-      // Also add to config.fish for autoload
-      profiles.push(path.join(fishDir, "config.fish"))
-    } else {
-      // bash
-      profiles.push(path.join(os.homedir(), ".bashrc"))
-      // Also check .bash_profile on macOS
-      if (process.platform === "darwin") {
-        profiles.push(path.join(os.homedir(), ".bash_profile"))
-      }
-    }
-
-    for (const profilePath of profiles) {
-      fs.mkdirSync(path.dirname(profilePath), { recursive: true })
-      let content = readFile(profilePath) || ""
-      if (content.includes("alias jarvis=") || content.includes("function jarvis")) {
-        info(`jarvis alias already in ${path.basename(profilePath)}`)
-        continue
-      }
-      if (fileExists(profilePath)) {
-        copyFile(profilePath, profilePath + ".jarvis-backup")
-      }
-      // Add at the end
-      content += (content.endsWith("\n") ? "" : "\n") + `${header}\n${aliasLine}\n`
-      writeFile(profilePath, content)
-      added = true
-    }
-  }
-
-  if (added) {
-    ok(`'jarvis' command added to ${ctx.shell} profile.`)
-    info(`Restart your terminal or 'source ~/.${ctx.shell === "zsh" ? "zshrc" : "bashrc"}' to use it.`)
-    if (ctx.shell === "powershell") {
-      info(`Restart PowerShell or run '. \$PROFILE' to use it.`)
-    }
-  }
-}
-
-// ────────────────────────────────────────────────────────────
-// Phase 7: System Dependencies (optional)
-// ────────────────────────────────────────────────────────────
-
-async function installSystemTools(ctx) {
-  const toolsToInstall = []
-
-  if (!ctx.tools.rg) toolsToInstall.push("rg")
-  if (!ctx.tools.fd) toolsToInstall.push("fd")
-  if (!ctx.tools.jq) toolsToInstall.push("jq")
-
-  if (toolsToInstall.length === 0) {
-    ok("System tools (rg, fd, jq) — all present")
-    return
-  }
-
-  step(5, `Installing system tools: ${toolsToInstall.join(", ")}`)
-
-  const installCmds = await detectPackageManager()
-
-  if (!installCmds) {
-    console.log(`${c.y}⚠${c.n}`)
-    info("No package manager found. Install manually:")
-    for (const tool of toolsToInstall) {
-      info(`  ${tool}: see https://github.com/BurntSushi/ripgrep#installation`)
-    }
-    return
-  }
-
-  let installed = 0
-  for (const tool of toolsToInstall) {
-    try {
-      startSpinner(`Installing ${tool}`)
-      await exec(installCmds.cmd, [...installCmds.args, tool], {
-        timeout: 120000,
-        stdio: "pipe",
-      })
-      stopSpinner(true)
-      installed++
-    } catch (e) {
-      stopSpinner(false)
-      warn(`Could not install ${tool}: ${e.message}`)
-    }
-  }
-
-  if (installed > 0) ok(`${installed} tool(s) installed.`)
-}
-
-async function detectPackageManager() {
-  if (process.platform === "win32") {
-    if (hasTool("winget"))  return { cmd: "winget", args: ["install", "--silent", "--accept-package-agreements"] }
-    if (hasTool("choco"))   return { cmd: "choco",  args: ["install", "-y"] }
-    if (hasTool("scoop"))   return { cmd: "scoop",  args: ["install"] }
-    return null
-  }
-  if (process.platform === "darwin") {
-    if (hasTool("brew"))    return { cmd: "brew",   args: ["install"] }
-    return null
-  }
-  // Linux
-  if (hasTool("apt-get"))  return { cmd: "sudo",   args: ["apt-get", "install", "-y"] }
-  if (hasTool("dnf"))      return { cmd: "sudo",   args: ["dnf", "install", "-y"] }
-  if (hasTool("pacman"))   return { cmd: "sudo",   args: ["pacman", "-S", "--noconfirm"] }
-  if (hasTool("apk"))      return { cmd: "apk",    args: ["add"] }
-  return null
-}
-
-// ────────────────────────────────────────────────────────────
-// Phase 8: Verification
-// ────────────────────────────────────────────────────────────
-
-async function verifyInstall(ctx) {
-  title("Verification")
-
-  let allGood = true
-
-  // Check opencode
-  try {
-    const version = execSync("opencode --version", { stdio: "pipe", timeout: 10000 }).toString().trim()
-    ok(`opencode ${version}`)
-  } catch {
-    warn("opencode command not found. Try: npm install -g @opencode-ai/opencode")
-    allGood = false
-  }
-
-  // Check config is valid JSON
-  const configPath = path.join(CONFIG_DIR, "opencode.jsonc")
-  if (fileExists(configPath)) {
-    try {
-      JSON.parse(readFile(configPath))
-      ok("Configuration is valid.")
-    } catch {
-      fail("Configuration has invalid JSON!")
-      allGood = false
-    }
-  } else {
-    fail("Configuration file not found!")
-    allGood = false
-  }
-
-  // Check key MCP binaries exist
-  const mcpBins = ["playwright-mcp", "mcp-server-filesystem", "mcp-server-memory", "mcp-sqlite-server", "mcp-server-sequential-thinking"]
-  for (const bin of mcpBins) {
-    const binPath = path.join(NODE_BIN_DIR, bin + (process.platform === "win32" ? ".cmd" : ""))
-    if (fileExists(binPath)) {
-      ok(`MCP ${bin} found.`)
-    } else {
-      warn(`MCP ${bin} not found at ${binPath}`)
-      allGood = false
-    }
-  }
-
-  // Check headroom
-  if (ctx.headroom.enabled && ctx.pythonPath) {
-    try {
-      execSync(`${ctx.pythonPath} -c "import headroom; print(headroom.__version__)"`, { stdio: "pipe", timeout: 10000 })
-      ok("headroom ready.")
-    } catch {
-      warn("headroom not found. Python MCP disabled.")
-    }
-  }
-
-  // Check jarvis alias
-  if (process.platform === "win32") {
-    try {
-      execSync("Get-Command jarvis -ErrorAction SilentlyContinue", { stdio: "pipe", shell: "powershell" })
-      ok("'jarvis' command resolves.")
+      const pkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf-8"))
+      pkgVersions = pkg.dependencies || {}
     } catch {}
-  } else {
-    try {
-      execSync("command -v jarvis", { stdio: "pipe" })
-      ok("'jarvis' command resolves.")
-    } catch {
-      // Alias might not be in current shell session yet
-      info("'jarvis' alias will be available after terminal restart.")
+    const depsWithVersions = getModuleNpmDeps(selectedModules, pkgVersions)
+
+    console.log(`  ${c.b}Would install:${c.n}`)
+    console.log(`    • npm packages:  ${depsWithVersions.length > 0 ? depsWithVersions.join(", ") : "(none)"}`)
+    console.log(`    • template files:  ${getModuleTemplateFiles(selectedModules).length}`)
+    console.log(`    • config sections: ${summary.sectionCount}`)
+    console.log(`    • shell alias:  jarvis`)
+    console.log(`    • system tools:  rg, fd, jq (if missing)`)
+    line()
+    return
+  }
+
+  // ── Final confirmation ────────────────────────────────
+  line()
+  console.log(`  ${c.m}════════════════════════════════════════${c.n}`)
+  console.log(`  ${c.b}Installation Plan${c.n}`)
+
+  // Read package versions
+  let pkgVersions = {}
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf-8"))
+    pkgVersions = pkg.dependencies || {}
+  } catch {}
+
+  const npmDeps = getModuleNpmDeps(selectedModules, pkgVersions)
+  const templateFiles = getModuleTemplateFiles(selectedModules)
+
+  console.log(`  Provider: ${c.b}${providerType}${c.n} → ${models.primary} / ${models.fast}`)
+  console.log(`  Autonomy: ${c.b}${autonomy}${c.n}`)
+  console.log(`  Modules:  ${c.b}${summary.moduleCount}${c.n} selected`)
+  console.log(`  npm:      ${npmDeps.length > 0 ? npmDeps.length + " packages" : "(none)"}`)
+  if (npmDeps.length > 0) {
+    for (const dep of npmDeps) {
+      console.log(`            ${c.d}• ${dep}${c.n}`)
     }
   }
-
-  return allGood
-}
-
-// ────────────────────────────────────────────────────────────
-// Success Screen
-// ────────────────────────────────────────────────────────────
-
-function printSuccess(ctx) {
-  const mcpCount = 5 + (ctx.mcp.github.enabled ? 1 : 0) + (ctx.headroom.enabled ? 1 : 0)
-  const langCount = Object.values(ctx.langs).filter(Boolean).length
-
-  console.log(`
-${c.g}╔══════════════════════════════════════════════════════════╗${c.n}
-${c.g}║${c.n}          ${c.b}${c.m}⚡  JARVIS — terminal AI ready  ${c.n}${c.g}              ║${c.n}
-${c.g}║${c.n}                                                      ${c.g}║${c.n}
-${c.g}║${c.n}  Type:  ${c.b}jarvis${c.n}                                          ${c.g}║${c.n}
-${c.g}║${c.n}                                                      ${c.g}║${c.n}
-${c.g}║${c.n}  Config:  ~/.config/opencode/                          ${c.g}║${c.n}
-${c.g}║${c.n}  Provider: ${ctx.provider.type} (${ctx.models.primary})               ${c.g}║${c.n}
-${c.g}║${c.n}  MCPs:    ${mcpCount} servers enabled                        ${c.g}║${c.n}
-${c.g}║${c.n}  LSPs:    ${langCount} languages active                       ${c.g}║${c.n}
-${c.g}║${c.n}  Subagents: 6                                           ${c.g}║${c.n}
-${c.g}║${c.n}  Autonomy: ${ctx.autonomy === "full" ? "FULL" : "SAFE"} ${ctx.autonomy === "full" ? c.r : c.y}${ctx.autonomy === "full" ? "⚠" : "🛡"}${c.n}                              ${c.g}║${c.n}
-${c.g}║${c.n}                                                      ${c.g}║${c.n}
-${c.g}║${c.n}  ${c.y}Post-install:${c.n}                                     ${c.g}║${c.n}
-${c.g}║${c.n}    Web automation: npx playwright install chromium     ${c.g}║${c.n}
-${c.g}║${c.n}    (requires ~300MB for browser binaries)              ${c.g}║${c.n}
-${c.g}║${c.n}                                                      ${c.g}║${c.n}
-${c.g}║${c.n}  ${c.c}Update:${c.n}  git pull && bash install.sh               ${c.g}║${c.n}
-${c.g}║${c.n}  ${c.r}Remove:${c.n}  bash uninstall.sh                           ${c.g}║${c.n}
-${c.g}║${c.n}                                                      ${c.g}║${c.n}
-${c.g}╚══════════════════════════════════════════════════════════╝${c.n}
-`)
-}
-
-// ────────────────────────────────────────────────────────────
-// Main
-// ────────────────────────────────────────────────────────────
-
-async function main() {
-  // Welcome
-  console.log(`
-${c.m}╔══════════════════════════════════════════════╗${c.n}
-${c.m}║${c.n}          ${c.b}JARVIS Terminal Setup${c.n}              ${c.m}║${c.n}
-${c.m}║${c.n}  One AI to rule your terminal.             ${c.m}║${c.n}
-${c.m}║${c.n}  Let's configure it for your machine.       ${c.m}║${c.n}
-${c.m}╚══════════════════════════════════════════════╝${c.n}
-`)
-
-  if (!process.stdout.isTTY) {
-    fail("This installer requires an interactive terminal.")
-    process.exit(1)
+  console.log(`  Templates:${templateFiles.length > 0 ? " " + templateFiles.length + " files" : " (none)"}`)
+  if (templateFiles.length > 0) {
+    for (const f of templateFiles.slice(0, 8)) {
+      console.log(`            ${c.d}• ${f}${c.n}`)
+    }
+    if (templateFiles.length > 8) {
+      console.log(`            ${c.d}• ... and ${templateFiles.length - 8} more${c.n}`)
+    }
   }
+  console.log(`  Shell:    ${c.b}jarvis${c.n} alias in ${env.shell} profile`)
+  console.log(`  ${c.m}════════════════════════════════════════${c.n}`)
+  line()
 
-  await pressEnter()
-
-  // Phase 1: Detect
-  title("Detecting your environment...")
-  const ctx = await detectEnvironment()
-  console.log(`  OS:      ${process.platform} / ${process.arch}${detectWsl() ? " (WSL)" : ""}`)
-  console.log(`  Shell:   ${ctx.shell}`)
-  console.log(`  Home:    ${ctx.homeDir}`)
-  console.log(`  Python:  ${ctx.pythonPath || "not found"}`)
-  if (ctx.hasExisting) info("Existing Jarvis config detected.")
-  if (ctx.hasOpencode) info("opencode already installed globally.")
-
-  // Phase 2: Prompts
-  title("Configuration")
-  await promptProvider(ctx)
-  await promptApiKey(ctx)
-  await promptLangs(ctx)
-  await promptGithub(ctx)
-  await promptAutonomy(ctx)
-
-  // Show summary and confirm
-  const providerLabel = {
-    openai: "OpenAI",
-    anthropic: "Anthropic",
-    ollama: "Ollama (local)",
-    custom: `Custom (${ctx.provider.baseURL})`,
-  }[ctx.provider.type]
-
-  const langActive = Object.entries(ctx.langs)
-    .filter(([, v]) => v)
-    .map(([k]) => k)
-    .join(", ")
-
-  const mcpCount = 5 + (ctx.mcp.github.enabled ? 1 : 0) + (ctx.headroom.enabled ? 1 : 0)
-
-  console.log(`\n${c.b}Installation Summary:${c.n}`)
-  console.log(`  Provider:  ${providerLabel}`)
-  console.log(`  Primary:   ${ctx.models.primary}`)
-  console.log(`  Fast:      ${ctx.models.fast}`)
-  console.log(`  LSPs:      ${langActive || "none"}`)
-  console.log(`  MCPs:      ${mcpCount} servers`)
-  console.log(`  Autonomy:  ${ctx.autonomy.toUpperCase()}`)
-  console.log(`  GitHub:    ${ctx.mcp.github.enabled ? "yes" : "no"}`)
-  console.log(`  Headroom:  ${ctx.headroom.enabled ? "yes" : "no"}`)
-  console.log(`  Config:    ${CONFIG_DIR}`)
-
-  const proceed = await confirm(`\nProceed with installation?`, true)
+  const proceed = await confirm("Proceed with installation?", true)
   if (!proceed) {
-    info("Installation cancelled.")
+    warn("Installation cancelled.")
     process.exit(0)
   }
 
-  // Phase 3-7: Install
-  await installDependencies(ctx)
-  await generateConfig(ctx)
-  await copyFiles()
-  await setupShellIntegration(ctx)
-  await installSystemTools(ctx)
+  line()
 
-  // Phase 8: Verify
-  await verifyInstall(ctx)
+  // ── Backup existing config ───────────────────────────
+  let backupPath = null
+  if (env.existingConfig) {
+    title("Backing Up Existing Config")
+    backupPath = backupDir(CONFIG_DIR)
+    if (backupPath) {
+      ok(`Backup created at: ${backupPath}`)
+      info("Run uninstall.sh to restore if needed.")
+    } else {
+      warn("Could not create backup.")
+    }
+    line()
+  }
 
-  // Success
-  printSuccess(ctx)
+  // ── Phases ────────────────────────────────────────────
+  const totalPhases = 8
+  let phase = 0
+  let allSuccess = true
+
+  // Phase 1: Install opencode globally
+  phase++
+  const phase1_ok = await runPhase(phase, totalPhases, "Installing opencode globally", async () => {
+    if (hasTool("opencode")) {
+      info("opencode already installed.")
+      const upgrade = await confirm("Upgrade to latest version?", false)
+      if (!upgrade) return
+    }
+    const npmCmd = findNpm()
+    await exec(npmCmd, ["install", "-g", "@opencode-ai/opencode@latest"])
+  })
+  if (!phase1_ok) allSuccess = false
+
+  // Phase 2: Install selected npm packages
+  phase++
+  const phase2_ok = await runPhase(phase, totalPhases, "Installing npm packages", async () => {
+    if (npmDeps.length === 0) {
+      info("No npm packages to install.")
+      return
+    }
+    const npmCmd = findNpm()
+    // Install into config dir so they're co-located with the config
+    fs.mkdirSync(CONFIG_DIR, { recursive: true })
+    // Batch install for speed
+    await exec(npmCmd, ["install", "--prefix", CONFIG_DIR, ...npmDeps])
+  })
+  if (!phase2_ok) allSuccess = false
+
+  // Phase 3: Generate config
+  phase++
+  const phase3_ok = await runPhase(phase, totalPhases, "Generating opencode configuration", async () => {
+    const ctx = {
+      platform: env.platform,
+      shell: env.shell,
+      nodeBinDir: NODE_BIN_DIR,
+      homeDir: env.homeDir,
+      configDir: CONFIG_DIR,
+      provider: { type: providerType, primary: models.primary, fast: models.fast },
+      apiKey: apiKey,
+      customEndpoint: customEndpoint,
+      autonomy: autonomy,
+      selectedModules: new Set(selectedModules),
+      hasGithubToken: hasGithubToken,
+      langs: env.detectedLangs,
+    }
+
+    const config = buildConfig(ctx)
+    const configPath = path.join(CONFIG_DIR, "opencode.jsonc")
+    writeFile(configPath, JSON.stringify(config, null, 2))
+
+    // Also write as JS for reference (for import)
+    writeFile(path.join(CONFIG_DIR, "opencode.json"), JSON.stringify(config, null, 2))
+  })
+  if (!phase3_ok) allSuccess = false
+
+  // Phase 4: Copy template files
+  phase++
+  const phase4_ok = await runPhase(phase, totalPhases, "Copying agent, skill, and plugin files", async () => {
+    if (templateFiles.length === 0) {
+      info("No template files to copy.")
+      return
+    }
+
+    for (const relPath of templateFiles) {
+      const src = path.join(TEMPLATE_DIR, relPath)
+      const dst = path.join(CONFIG_DIR, relPath)
+      if (fileExists(src)) {
+        // Backup existing file
+        if (fileExists(dst) && !FLAGS.yes) {
+          const backupFile = dst + ".jarvis-backup"
+          fs.copyFileSync(dst, backupFile)
+        }
+        copyFile(src, dst)
+      } else {
+        warn(`Template not found: ${relPath}`)
+      }
+    }
+  })
+  if (!phase4_ok) allSuccess = false
+
+  // Phase 5: Shell integration
+  phase++
+  const phase5_ok = await runPhase(phase, totalPhases, "Adding jarvis alias to shell profile", async () => {
+    const aliasLine = `alias jarvis='opencode --agent jarvis'`
+    let profilePath = ""
+
+    if (env.platform === "win32") {
+      // PowerShell profile — write a temp script to avoid quoting hell
+      const psScript = [
+        "$profilePath = Join-Path $HOME 'Documents/PowerShell/Microsoft.PowerShell_profile.ps1'",
+        "$aliasLine = 'function jarvis { opencode --agent jarvis @args }'",
+        "if (-not (Test-Path $profilePath)) {",
+        "  New-Item -ItemType File -Path $profilePath -Force | Out-Null",
+        "}",
+        "$content = Get-Content $profilePath -Raw",
+        "if ($content -notmatch [regex]::Escape($aliasLine)) {",
+        '  Add-Content $profilePath "`r`n$aliasLine"',
+        "  Write-Host 'Added jarvis alias to PowerShell profile: ' $profilePath",
+        "} else {",
+        "  Write-Host 'jarvis alias already exists in profile'",
+        "}"
+      ].join(";`n")
+
+      const tmpScript = path.join(os.tmpdir(), "jarvis-add-alias.ps1")
+      fs.writeFileSync(tmpScript, psScript, "utf-8")
+      execSync(`powershell -NoProfile -ExecutionPolicy Bypass -File "${tmpScript}"`, { stdio: "pipe" })
+      fs.unlinkSync(tmpScript)
+      ok("jarvis function added to PowerShell profile")
+    } else {
+      // Unix: bash/zsh/fish
+      const rcFiles = {
+        bash: path.join(env.homeDir, ".bashrc"),
+        zsh: path.join(env.homeDir, ".zshrc"),
+        fish: path.join(env.homeDir, ".config", "fish", "config.fish"),
+      }
+
+      const target = rcFiles[env.shell]
+      if (target && fileExists(target)) {
+        const content = readFile(target) || ""
+        if (!content.includes(aliasLine)) {
+          writeFile(target, content + "\n" + aliasLine + "\n")
+          ok(`Alias added to ${target}`)
+        } else {
+          info("jarvis alias already exists in profile.")
+        }
+      } else if (target) {
+        writeFile(target, aliasLine + "\n")
+        ok(`Created ${target} with jarvis alias`)
+      }
+
+      // Also try bashrc/zshrc as fallback
+      for (const [shell, rcPath] of Object.entries(rcFiles)) {
+        if (rcPath === target) continue // already handled
+        if (fileExists(rcPath)) {
+          const content = readFile(rcPath) || ""
+          if (!content.includes(aliasLine)) {
+            writeFile(rcPath, content + "\n" + aliasLine + "\n")
+            ok(`Alias also added to ${rcPath} (fallback)`)
+          }
+        }
+      }
+    }
+  })
+  if (!phase5_ok) allSuccess = false
+
+  // Phase 6: Install system tools (rg, fd, jq)
+  phase++
+  const phase6_ok = await runPhase(phase, totalPhases, "Checking system tools (rg, fd, jq)", async () => {
+    const missing = []
+    if (!hasTool("rg")) missing.push("rg (ripgrep)")
+    if (!hasTool("fd")) missing.push("fd")
+    if (!hasTool("jq")) missing.push("jq")
+
+    if (missing.length === 0) {
+      info("All system tools found.")
+      return
+    }
+
+    warn(`Missing: ${missing.join(", ")}`)
+    const installNow = await confirm("Attempt to install missing tools?", true)
+    if (!installNow) {
+      warn("Skipping system tool installation.")
+      return
+    }
+
+    // Tries best-effort install (won't fail phase)
+    if (env.platform === "win32") {
+      for (const tool of ["ripgrep", "fd", "jq"]) {
+        const isMissing = (tool === "ripgrep" && !hasTool("rg")) ||
+                          (tool === "fd" && !hasTool("fd")) ||
+                          (tool === "jq" && !hasTool("jq"))
+        if (isMissing) {
+          try {
+            if (hasTool("winget")) {
+              const pkgName = tool === "ripgrep" ? "BurntSushi.ripgrep.MSVC" : tool === "fd" ? "sharkdp.fd" : "stedolan.jq"
+              await exec("winget", ["install", pkgName, "--silent", "--accept-package-agreements"], { timeout: 60000 })
+            } else if (hasTool("scoop")) {
+              await exec("scoop", ["install", tool], { timeout: 60000 })
+            }
+          } catch { /* best effort */ }
+        }
+      }
+    } else {
+      for (const tool of ["ripgrep", "fd", "jq"]) {
+        const isMissing = (tool === "ripgrep" && !hasTool("rg")) ||
+                          (tool === "fd" && !hasTool("fd")) ||
+                          (tool === "jq" && !hasTool("jq"))
+        if (isMissing) {
+          try {
+            if (hasTool("brew")) {
+              await exec("brew", ["install", tool], { timeout: 60000 })
+            } else if (hasTool("apt-get")) {
+              const aptPkg = tool === "ripgrep" ? "ripgrep" : tool === "fd" ? "fd-find" : "jq"
+              await exec("sudo", ["apt-get", "install", "-y", aptPkg], { timeout: 60000 })
+            }
+          } catch { /* best effort */ }
+        }
+      }
+    }
+
+    // Report results
+    const stillMissing = []
+    if (!hasTool("rg")) stillMissing.push("rg")
+    if (!hasTool("fd")) stillMissing.push("fd")
+    if (!hasTool("jq")) stillMissing.push("jq")
+    if (stillMissing.length > 0) {
+      warn(`Still missing: ${stillMissing.join(", ")}. Install manually for full functionality.`)
+    } else {
+      ok("All system tools are available.")
+    }
+  })
+  if (!phase6_ok) allSuccess = false
+
+  // Phase 7: Verify installation
+  phase++
+  const phase7_ok = await runPhase(phase, totalPhases, "Verifying installation", async () => {
+    const checks = []
+
+    // Check opencode
+    try {
+      const ver = execSync("opencode --version", { stdio: "pipe" }).toString().trim()
+      checks.push({ name: "opencode", ok: true, detail: ver })
+    } catch {
+      checks.push({ name: "opencode", ok: false, detail: "not found" })
+    }
+
+    // Check config file
+    const configPath = path.join(CONFIG_DIR, "opencode.jsonc")
+    checks.push({ name: "config file", ok: fileExists(configPath), detail: configPath })
+
+    // Check npm installed packages
+    for (const dep of npmDeps) {
+      const pkgName = dep.split("@")[0]
+      const pkgPath = path.join(CONFIG_DIR, "node_modules", pkgName)
+      checks.push({ name: `npm: ${pkgName}`, ok: fileExists(pkgPath), detail: pkgPath })
+    }
+
+    // Check template files
+    for (const relPath of templateFiles) {
+      const dst = path.join(CONFIG_DIR, relPath)
+      checks.push({ name: `file: ${relPath}`, ok: fileExists(dst), detail: dst })
+    }
+
+    // Count results
+    const failed = checks.filter((c) => !c.ok)
+    const passed = checks.filter((c) => c.ok)
+
+    if (failed.length > 0) {
+      warn(`${failed.length} check(s) failed:`)
+      for (const f of failed) {
+        console.log(`         ${c.r}✗${c.n} ${f.name} — ${f.detail}`)
+      }
+      return false
+    }
+
+    ok(`All ${checks.length} checks passed.`)
+    return true
+  })
+  if (!phase7_ok) allSuccess = false
+
+  // ── Success / Failure ─────────────────────────────────
+  line()
+  if (allSuccess) {
+    console.log(`  ${c.m}╔══════════════════════════════════════════╗${c.n}`)
+    console.log(`  ${c.m}║${c.n}  ${c.g}${c.b}Installation Complete!${c.n}                 ${c.m}║${c.n}`)
+    console.log(`  ${c.m}╚══════════════════════════════════════════╝${c.n}`)
+    line()
+    console.log(`  ${c.b}Quick start:${c.n}`)
+    console.log(`    ${c.c}1.${c.n} Close and re-open your terminal (or source your profile)`)
+    console.log(`    ${c.c}2.${c.n} Type: ${c.b}jarvis${c.n}`)
+    console.log(`    ${c.c}3.${c.n} Start asking!`)
+    line()
+
+    if (selectedModules.includes("mcp-browser")) {
+      console.log(`  ${c.y}Note:${c.n} For browser automation, install Playwright browser binaries:`)
+      console.log(`    npx playwright install chromium`)
+      line()
+    }
+
+    console.log(`  ${c.d}Config:       ~/.config/opencode/opencode.jsonc${c.n}`)
+    console.log(`  ${c.d}Agents:       ~/.config/opencode/agents/*.md${c.n}`)
+    console.log(`  ${c.d}Plugins:      ~/.config/opencode/plugins/jarvis-optimizer.ts${c.n}`)
+    console.log(`  ${c.d}Uninstall:    cd Jarvis && bash uninstall.sh${c.n}`)
+    if (backupPath) {
+      console.log(`  ${c.d}Backup:       ${backupPath}${c.n}`)
+    }
+  } else {
+    console.log(`  ${c.r}╔══════════════════════════════════════════╗${c.n}`)
+    console.log(`  ${c.r}║${c.n}  ${c.b}Installation incomplete — some phases failed${c.n}  ${c.r}║${c.n}`)
+    console.log(`  ${c.r}╚══════════════════════════════════════════╝${c.n}`)
+    line()
+    console.log(`  Re-run the installer to retry failed phases.`)
+    console.log(`  It will detect existing files and offer to upgrade.`)
+    if (backupPath) {
+      console.log(`  Backup: ${backupPath}`)
+    }
+  }
+
+  line()
+  process.exit(allSuccess ? 0 : 1)
 }
 
 main().catch((err) => {
-  console.error(`\n${c.r}Installation failed: ${err.message}${c.n}`)
-  console.error(`  You can re-run the installer to resume from where it left off.`)
+  console.error(`\n  ${c.r}✗${c.n} Fatal error:`, err.message)
   process.exit(1)
 })

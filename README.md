@@ -1,14 +1,14 @@
 # Jarvis — One AI to rule your terminal
 
-> A zero-friction, maximum-power AI assistant for your terminal.  
-> One command installs everything: subagents, MCP servers, language servers, and shell integration.
+> A zero-friction, modular AI assistant for your terminal.  
+> Pick your profile, run one command, and you're talking to an AI.
 
 ---
 
 ## Quick start
 
 ```bash
-git clone https://github.com/<your-org>/Jarvis
+git clone https://github.com/damiankovac0-pixel/Jarvis
 cd Jarvis
 
 # Windows:
@@ -18,90 +18,146 @@ cd Jarvis
 bash install.sh
 ```
 
-That's it. Answer 5 questions about your preferences, then type `jarvis` and you're talking to your terminal AI.
+The installer walks you through everything. You choose your level — from a bare-bones agent to a full suite with subagents, MCP servers, and language support.
 
 ---
 
-## What you get
+## Choose your profile
+
+The installer starts by asking which profile fits you best. Everything else flows from that choice.
+
+| Profile | What you get | Install time | Disk usage |
+|---------|-------------|--------------|------------|
+| **Lite** 🚀 | Core agent + provider config. No extras. | ~10s | ~10 MB |
+| **Standard** ⚡ | Agent + 5 subagents + Browser/Filesystem/Memory/Sequential Thinking MCPs + Skills + Plugin | ~30s | ~50 MB |
+| **Full** 💎 | Everything in Standard + all MCPs (GitHub, SQLite) + all detected language servers | ~2m | ~200 MB |
+| **Custom** 🛠️ | Pick exactly which modules you want — mix and match | depends | depends |
+
+### What's in each module
+
+Core modules (always included with any profile):
+
+| Module | What it adds |
+|--------|-------------|
+| **Core Config** | Provider setup, permissions, Jarvis agent persona, shell alias |
+
+Optional modules you can add or remove freely:
+
+| Module | npm packages | Template files | Config sections |
+|--------|-------------|----------------|-----------------|
+| **Subagents** | — | 5 agent `.md` files | `agent` entries for sysadmin, webnav, automation, memory-keeper, explore, general |
+| **Skills** | — | 3 skill `.md` files | `skills` paths |
+| **Plugin** | `@opencode-ai/plugin` | `jarvis-optimizer.ts` | `plugin` reference |
+| **MCP: Browser** | `@modelcontextprotocol/server-playwright` | — | `mcp.playwright` |
+| **MCP: Filesystem** | `@modelcontextprotocol/server-filesystem` | — | `mcp.filesystem` |
+| **MCP: Memory** | `@modelcontextprotocol/server-memory` | — | `mcp.memory` |
+| **MCP: Sequential Thinking** | `@modelcontextprotocol/server-sequential-thinking` | — | `mcp.sequential-thinking` |
+| **MCP: GitHub** | `@modelcontextprotocol/server-github` | — | `mcp.github` (requires token) |
+| **MCP: SQLite** | `mcp-server-sqlite` | — | `mcp.sqlite` |
+| **LSP: TypeScript/JS** | `typescript-language-server` | — | `lsp.typescript` |
+| **LSP: Python** | `pyright-langserver` | — | `lsp.pyright` |
+| **LSP: HTML** | `vscode-langservers-extracted` | — | `lsp.html` |
+| **LSP: CSS/SCSS** | `vscode-langservers-extracted` | — | `lsp.css` |
+| **LSP: JSON** | `vscode-langservers-extracted` | — | `lsp.json` |
+| **LSP: YAML** | `yaml-language-server` | — | `lsp.yaml` |
+| **LSP: Shell** | `bash-language-server` | — | `lsp.bash` |
+| **LSP: Dockerfile** | `dockerfile-language-server-nodejs` | — | `lsp.dockerfile` |
+| **LSP: ESLint** | `vscode-eslint-language-server` | — | `lsp.eslint` |
+| **LSP: PHP** | `intelephense` | — | `lsp.php` |
+| **LSP: SQL** | `sql-language-server` | — | `lsp.sql` |
+| **LSP: Ansible** | `ansible-language-server` | — | `lsp.ansible` |
+| **LSP: Prisma** | `@prisma/language-server` | — | `lsp.prisma` |
+
+### How the Custom flow works
+
+Selecting **Custom** shows an interactive checklist of every optional module. Toggle them on/off by number, page through with `n`/`p`, and press Enter when done. Core is always included.
+
+---
+
+## What you get (Standard profile)
 
 ### 6 specialized AI subagents
 
 | Subagent | Purpose | Delegation trigger |
 |----------|---------|-------------------|
-| `sysadmin` | System administration, OS-level tasks | "check system", "install package", "disk usage" |
-| `webnav` | Browser automation, web scraping, form filling | "go to website", "scrape data", "fill form" |
-| `automation` | Scripting, batch jobs, API integration | "write a script", "automate task", "cron job" |
-| `memory-keeper` | Persistent cross-session knowledge | "remember that", "what did we do last time" |
-| `explore` | Read-only codebase search | "find where", "how does this module work" |
+| `sysadmin` | System administration, OS-level tasks | "check system", "install package" |
+| `webnav` | Browser automation, web scraping | "go to website", "scrape data" |
+| `automation` | Scripting, batch jobs, API integration | "write a script", "automate task" |
+| `memory-keeper` | Persistent cross-session knowledge | "remember that" |
+| `explore` | Read-only codebase search | "find where", "how does this work" |
 | `general` | Anything that doesn't fit above | Everything else |
 
-Each subagent runs on your configured fast model (cheap) while Jarvis itself uses your primary model (powerful) for orchestration and complex reasoning.
+Each subagent runs on your configured fast model while Jarvis itself uses your primary model for orchestration.
 
-### 7 MCP servers
+### 4 MCP servers (Standard)
 
-| Server | What it enables |
-|--------|----------------|
-| **Playwright** | Web navigation, screenshots, form automation |
-| **Filesystem** | Full file system access, read/write/glob |
-| **GitHub** | Repo search, PR creation, issue tracking (optional, needs token) |
-| **Memory** | Knowledge graph for cross-session persistence |
-| **SQLite** | Database queries and management |
-| **Sequential Thinking** | Structured multi-step reasoning |
-| **Headroom** | Output compression to save context tokens |
+- **Playwright** — Web navigation, screenshots, form automation
+- **Filesystem** — Full file system access
+- **Memory** — Knowledge graph for cross-session persistence
+- **Sequential Thinking** — Structured multi-step reasoning
 
-### Language support (auto-detected)
-
-LSP servers are installed for all languages; only the ones detected on your system are activated:
-
-TypeScript/JS · Python · HTML · CSS/SCSS · JSON · YAML · Shell  
-Dockerfile · ESLint · PHP · SQL · Ansible · Prisma
+Full adds GitHub (optional, needs token) and SQLite.
 
 ### All baked in
 
-- `opencode` as the AI terminal interface
-- Output compaction (no context-window flooding)
-- Auto-compaction and pruning for long sessions
+- Output compaction with auto-pruning for long sessions
 - Batch tool execution for efficiency
 - Cross-platform: Windows, macOS, Linux (including WSL)
 
 ---
 
-## Install walkthrough
+## Trust & transparency
 
-The installer detects your environment then asks 5 questions:
+Jarvis is designed to be trustworthy by default.
 
+### Before installation
+
+1. **You choose exactly what to install** — profile or custom module selection
+2. **Full plan shown before any changes** — every npm package, every file, every config change is listed
+3. **You confirm before anything happens** — no silent installations
+
+### During installation
+
+4. **Non-admin by default** — runs as your user, no `sudo` unless required for system tools
+5. **Existing config is backed up** — if you already have an opencode setup, a full backup is created
+6. **Every phase is tracked** — success/failure per phase, no hidden errors
+7. **Verification step** — checks every expected file and package exists after install
+
+### After installation
+
+8. **Everything is undoable** — run `uninstall.sh` / `uninstall.ps1` from the repo
+9. **API keys are environment variables** — never stored in config files
+10. **All scripts are readable** — open the repo and read any file before running it
+
+### Dry run
+
+Pass `--dry-run` to see exactly what would happen without making any changes:
+
+```bash
+node src/install.mjs --dry-run
 ```
-1/5  Which AI provider?        OpenAI / Anthropic / Ollama / Custom
-2/5  API key                   Masked input → stored as env var
-3/5  Language servers          Toggle detected languages
-4/5  GitHub integration        Optional token for MCP
-5/5  Autonomy level            Full (no ask) / Safe (ask before actions)
-```
-
-Then it installs everything, generates your config, copies agent files, adds `jarvis` to your shell, and verifies the setup.
 
 ---
 
-## Usage
+## Install walkthrough
 
-```bash
-# Start a session
-jarvis
-
-# Quick command
-jarvis "find all unused variables in this project"
-
-# Show version
-jarvis --help
 ```
-
-Once inside, Jarvis dispatches work to the right subagent automatically. You don't need to think about which tool to use — just describe what you want.
+Step 1: Welcome + environment detection
+Step 2: Profile selection (Lite/Standard/Full/Custom)
+Step 3: Module summary + confirmation
+Step 4: Provider setup + API key (masked input)
+Step 5: GitHub integration (optional)
+Step 6: Autonomy level (Full / Safe)
+Step 7: Installation plan review
+Step 8: Execute (8 phases with progress)
+Step 9: Verification + next steps
+```
 
 ---
 
 ## Customization
 
-### After install, edit what you want:
+### After install, edit what you want
 
 ```bash
 # Agent instructions (how each subagent behaves)
@@ -119,14 +175,22 @@ Once inside, Jarvis dispatches work to the right subagent automatically. You don
 ~/.config/opencode/skills/
 ```
 
-### Or re-run the installer to reconfigure:
+### Re-run the installer to reconfigure
 
 ```bash
 git pull
 bash install.sh
 ```
 
-It detects your existing config and offers to upgrade or reconfigure.
+It detects your existing config, backs it up, and walks you through setup again.
+
+### Non-interactive mode
+
+Pass `-y` or `--yes` to skip confirmations (uses defaults):
+
+```bash
+node src/install.mjs -y
+```
 
 ---
 
@@ -138,11 +202,7 @@ git pull
 bash install.sh
 ```
 
-The installer will:
-1. Detect your existing configuration
-2. Offer to upgrade npm packages (`npm update`)
-3. Update agent files (backing up any you've modified)
-4. Preserve your API keys and provider settings
+The installer detects your existing configuration, offers to upgrade npm packages, updates agent files (backing up any modified ones), and preserves your API keys and provider settings.
 
 ---
 
@@ -154,21 +214,17 @@ The installer will:
 bash uninstall.sh        # macOS / Linux
 ```
 
-### Or manually:
+**What stays:** Node.js, Python, Git, ripgrep, fd, jq, and any npm packages installed globally — these are system tools, not Jarvis-specific.  
+**What goes:** Everything in `~/.config/opencode/` and the `jarvis` shell alias.  
+**Safety:** Both uninstallers require typing `REMOVE` (not just Y/n) to confirm.
+
+### Manual uninstall
 
 ```bash
-# Remove config and agents
 rm -rf ~/.config/opencode
-
-# Remove jarvis alias from your shell profile
-# (edit ~/.bashrc, ~/.zshrc, or PowerShell $PROFILE)
-
-# Optional: uninstall opencode
-npm uninstall -g @opencode-ai/opencode
+# Remove jarvis alias from ~/.bashrc, ~/.zshrc, or PowerShell $PROFILE
+npm uninstall -g @opencode-ai/opencode  # optional
 ```
-
-**What stays:** Node.js, Python, Git, ripgrep, fd, jq — these are system tools, not Jarvis-specific.  
-**What goes:** Everything in `~/.config/opencode/` and the `jarvis` shell alias.
 
 ---
 
@@ -177,44 +233,39 @@ npm uninstall -g @opencode-ai/opencode
 ### Can I use this for free?
 
 **Yes, two ways:**
-1. **Ollama** — The installer offers Ollama as a provider. It's fully local and free. You need a reasonably powerful machine for the larger models.
-2. **OpenCode's free model** — `opencode/deepseek-v4-flash-free` is available for basic tasks. Limited but functional.
+1. **Ollama** — The installer offers Ollama as a provider. Fully local and free.
+2. **OpenCode's free model** — `opencode/deepseek-v4-flash-free` is available for basic tasks.
 
 ### Do I need an API key?
 
-- **OpenAI / Anthropic** — Yes, you need a paid API key from the provider.
+- **OpenAI / Anthropic** — Yes, you need a paid API key.
 - **Ollama** — No, it runs locally.
 - **Custom endpoint** — Depends on your setup.
 
-The installer masks your input and stores the key as an environment variable. It never ends up in your config file.
-
-### Is my data private?
-
-- **Ollama** — Fully local. Nothing leaves your machine.
-- **OpenAI / Anthropic** — Your prompts are sent to their API. Check their privacy policies.
-- **Custom endpoint** — Depends on where you point it (could be local, could be a VPS, etc.)
+The installer masks your input and stores the key as an environment variable reference. It never ends up in your config file.
 
 ### Web automation doesn't work
 
-The Playwright MCP is installed, but the browser binaries aren't. Run:
+Playwright browser binaries aren't installed by default. Run:
 
 ```bash
 npx playwright install chromium
 ```
 
-This downloads ~300MB for browser automation. The installer tells you this at the end.
+This downloads ~300MB for browser automation.
 
 ### Can I add my own tools?
 
 Yes. Jarvis is built on opencode, which supports:
-- **Custom MCP servers** — Add them to `~/.config/opencode/opencode.jsonc`
+
+- **Custom MCP servers** — Add to `opencode.jsonc`
 - **Custom agents** — Add `.md` files to `~/.config/opencode/agents/`
 - **Custom skills** — Add to `~/.config/opencode/skills/`
-- **Environment variables** — Access them via `${VAR_NAME}` in config
+- **Environment variables** — Access via `${VAR_NAME}` in config
 
 ### Can I use this in CI/CD or non-interactive mode?
 
-Not currently. The installer is interactive. But the generated config can be copied to other machines.
+With `-y` / `--yes` flag, the installer uses defaults for all prompts. You can also pre-set environment variables to skip questions entirely.
 
 ### What if I break something?
 
@@ -225,53 +276,25 @@ Re-run the installer. It's idempotent — backs up modified files, detects exist
 ## Architecture
 
 ```
-┌─ You ─────────────────────────────────────┐
-│  $ jarvis "find the bug in api handler"   │
-└────────────────┬──────────────────────────┘
-                 │
-┌────────────────▼──────────────────────────┐
-│  Jarvis (primary agent, strong model)     │
-│  • Understands intent                     │
-│  • Delegates to specialists               │
-│  • Synthesizes results                    │
-└───┬────────┬────────┬────────┬────────────┘
-    │        │        │        │
-    ▼        ▼        ▼        ▼
-┌──────┐ ┌──────┐ ┌──────┐ ┌──────────┐
-│explore│ │webnav│ │sysadm│ │automation│
-│flash  │ │flash │ │flash │ │flash     │
-│read-  │ │browse│ │manage│ │script    │
-│only   │ │web   │ │system│ │& automate│
-└──────┘ └──────┘ └──────┘ └──────────┘
+Jarvis/
+├── src/
+│   ├── install.mjs        # Interactive modular installer (8 phases)
+│   ├── config-builder.mjs # Pure-function config generator
+│   └── modules.mjs        # Module & profile definitions
+├── install.ps1            # Windows bootstrap (Node.js check)
+├── install.sh             # Unix bootstrap (Node.js check)
+├── uninstall.ps1          # Windows uninstall
+├── uninstall.sh           # Unix uninstall
+├── package.json           # All dependencies (installer cherry-picks)
+├── template/
+│   ├── agents/            # Agent instruction files
+│   ├── plugins/           # Optimizer plugin
+│   └── skills/            # Skill instruction bundles
+└── README.md
 ```
-
-Jarvis routes work to specialized subagents (running your cheap model) while handling orchestration and complex reasoning itself (running your strong model). This saves tokens and keeps responses fast.
-
----
-
-## What's installed
-
-| Category | Count | Details |
-|----------|-------|---------|
-| npm packages | 18 | MCP servers + LSP servers |
-| Python packages | 1 | headroom (output compression) |
-| Agent files | 6 | Subagent instruction sets |
-| Skills | 3 | Development, system, web automation |
-| Plugin | 1 | Efficiency optimizer |
-
-Total download: ~150MB (npm) + ~300MB optional (Playwright browsers)
-
----
-
-## Requirements
-
-- **Node.js** >= 18 (installed automatically if missing)
-- **Git** (to clone the repo)
-- **Python** >= 3.10 (optional, for headroom compression)
-- An **AI provider** (OpenAI, Anthropic, Ollama, or custom endpoint)
 
 ---
 
 ## License
 
-MIT — do whatever you want with it.
+MIT
