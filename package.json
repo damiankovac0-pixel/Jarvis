@@ -1,0 +1,31 @@
+{
+  "name": "jarvis-terminal",
+  "version": "1.0.0",
+  "private": true,
+  "description": "One AI to rule your terminal — zero-config AI assistant with subagents, MCP servers, and LSP support.",
+  "type": "module",
+  "scripts": {
+    "install": "node src/install.mjs",
+    "uninstall": "node src/uninstall.mjs"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.0.0",
+    "@modelcontextprotocol/server-playwright": "^1.0.0",
+    "@modelcontextprotocol/server-filesystem": "^0.6.0",
+    "@modelcontextprotocol/server-github": "^1.0.0",
+    "@modelcontextprotocol/server-memory": "^1.0.0",
+    "@modelcontextprotocol/server-sequential-thinking": "^1.0.0",
+    "mcp-server-sqlite": "^2.0.0",
+    "typescript-language-server": "^4.0.0",
+    "pyright-langserver": "^1.0.0",
+    "yaml-language-server": "^1.15.0",
+    "bash-language-server": "^5.0.0",
+    "dockerfile-language-server-nodejs": "^0.12.0",
+    "vscode-langservers-extracted": "^4.0.0",
+    "vscode-eslint-language-server": "^3.0.0",
+    "intelephense": "^1.10.0",
+    "sql-language-server": "^1.0.0",
+    "ansible-language-server": "^2.0.0",
+    "@prisma/language-server": "^1.0.0"
+  }
+}
